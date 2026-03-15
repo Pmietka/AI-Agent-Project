@@ -28,6 +28,13 @@ try:
 except ImportError:
     ANTHROPIC_AVAILABLE = False
 
+try:
+    import requests
+    from bs4 import BeautifulSoup
+    SCRAPING_AVAILABLE = True
+except ImportError:
+    SCRAPING_AVAILABLE = False
+
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
@@ -270,6 +277,244 @@ SAMPLE_RESPONSES = [
     "What kind of results do you get for insulation companies?",
     "I've been thinking about getting more online reviews. Call me.",
 ]
+
+# =============================================================================
+# LIVE SCRAPING  (requests + BeautifulSoup, with sample-data fallback)
+# =============================================================================
+
+def scrape_prospects(trade, city, state):
+    """
+    Attempt a live Google search for "{trade} contractor {city} {state}" and
+    parse real business listings from the HTML response.
+
+    Returns a list of prospect dicts that match SAMPLE_PROSPECTS format so
+    every downstream step works unchanged.
+
+    Falls back to (or supplements with) SAMPLE_PROSPECTS when:
+      - requests / beautifulsoup4 are not installed
+      - the HTTP request fails
+      - fewer than 5 usable results are extracted
+    Never raises — the entire body is wrapped in try/except.
+    """
+    import re, json
+
+    location = f"{city}, {state}"
+
+    # ── library guard ────────────────────────────────────────────────────────
+    if not SCRAPING_AVAILABLE:
+        console.print(
+            "[yellow][!] requests / beautifulsoup4 not installed — "
+            "using sample data. Run: pip install requests beautifulsoup4[/yellow]"
+        )
+        return _sample_fallback(trade, location)
+
+    try:
+        query = f"{trade} contractor {city} {state}"
+
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/122.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                      "image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
+            "DNT": "1",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+        }
+
+        resp = requests.get(
+            "https://www.google.com/search",
+            params={"q": query, "num": 20, "hl": "en", "gl": "us"},
+            headers=headers,
+            timeout=15,
+        )
+        resp.raise_for_status()
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+        prospects = []
+
+        # Compiled patterns reused across both strategies
+        phone_re   = re.compile(r'\(?\b(\d{3})\)?[\s\-\.](\d{3})[\s\-\.](\d{4})\b')
+        rating_re  = re.compile(r'(\d\.\d)\s*(?:stars?|★|out\s+of\s+5)', re.I)
+        reviews_re = re.compile(r'([\d,]+)\s*(?:Google\s+)?reviews?', re.I)
+
+        def fmt_phone(m):
+            return f"({m.group(1)}) {m.group(2)}-{m.group(3)}"
+
+        def safe_email(name):
+            slug = re.sub(r'[^a-z0-9]', '', name.lower())[:20]
+            return f"info@{slug}.com"
+
+        # ── Strategy 1: JSON-LD structured data ─────────────────────────────
+        # Google occasionally embeds LocalBusiness schema in the page head.
+        VALID_TYPES = {
+            "LocalBusiness", "HomeAndConstructionBusiness",
+            "Plumber", "RoofingContractor", "Electrician",
+            "GeneralContractor", "HVACBusiness", "ProfessionalService",
+        }
+        seen_names = set()
+
+        for script in soup.find_all("script", type="application/ld+json"):
+            try:
+                data  = json.loads(script.string or "")
+                items = data if isinstance(data, list) else [data]
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    if item.get("@type", "") not in VALID_TYPES:
+                        continue
+                    name = (item.get("name") or "").strip()
+                    if not name or name.lower() in seen_names:
+                        continue
+
+                    phone_raw = item.get("telephone") or ""
+                    pm = phone_re.search(phone_raw)
+                    phone_str = fmt_phone(pm) if pm else "N/A"
+
+                    agg = item.get("aggregateRating") or {}
+                    try:    rating  = round(float(agg.get("ratingValue", 0)), 1)
+                    except: rating  = 0.0
+                    try:    reviews = int(str(agg.get("reviewCount", 0)).replace(",", ""))
+                    except: reviews = 0
+
+                    url = item.get("url") or ""
+                    has_web = bool(url and "google.com" not in url)
+
+                    addr = item.get("address") or {}
+                    loc_str = (
+                        f"{addr.get('addressLocality', city)}, "
+                        f"{addr.get('addressRegion', state)}"
+                    )
+
+                    seen_names.add(name.lower())
+                    prospects.append({
+                        "business_name":        name,
+                        "owner_name":           "Business Owner",
+                        "phone":                phone_str,
+                        "email":                safe_email(name),
+                        "location":             loc_str,
+                        "trade":                trade,
+                        "has_website":          has_web,
+                        "has_social_media":     False,
+                        "runs_paid_ads":        False,
+                        "google_reviews_count": reviews,
+                        "rating":               rating,
+                    })
+            except Exception:
+                continue
+
+        # ── Strategy 2: plain-text phone + name extraction ──────────────────
+        # Walk page text looking for lines with phone numbers; scan the
+        # preceding lines for a plausible business name and rating.
+        SKIP_WORDS = {
+            "google", "search", "map", "more results", "sponsored",
+            "hours", "open", "closed", "website", "directions", "call",
+            "ad ·", "results", "next", "previous", "privacy", "terms",
+        }
+
+        page_text = soup.get_text(separator="\n")
+        lines = [l.strip() for l in page_text.splitlines() if l.strip()]
+
+        for i, line in enumerate(lines):
+            if len(prospects) >= 15:
+                break
+
+            pm = phone_re.search(line)
+            if not pm:
+                continue
+
+            phone_str    = fmt_phone(pm)
+            name_cand    = ""
+            rating_val   = 0.0
+            reviews_val  = 0
+
+            # Scan up to 7 preceding lines for name / rating / reviews
+            for prev in lines[max(0, i - 7): i]:
+                if any(sw in prev.lower() for sw in SKIP_WORDS):
+                    continue
+
+                rm = rating_re.search(prev)
+                rvm = reviews_re.search(prev)
+                if rm:
+                    try: rating_val = float(rm.group(1))
+                    except: pass
+                if rvm:
+                    try: reviews_val = int(rvm.group(1).replace(",", ""))
+                    except: pass
+
+                # A business name: title-case start, 2-7 words, no digits
+                words = prev.split()
+                if (not rm and not rvm
+                        and 2 <= len(words) <= 8
+                        and prev[0].isupper()
+                        and not re.search(r'\d', prev)
+                        and len(prev) < 70):
+                    name_cand = prev
+
+            if name_cand and name_cand.lower() not in seen_names:
+                seen_names.add(name_cand.lower())
+                prospects.append({
+                    "business_name":        name_cand,
+                    "owner_name":           "Business Owner",
+                    "phone":                phone_str,
+                    "email":                safe_email(name_cand),
+                    "location":             location,
+                    "trade":                trade,
+                    "has_website":          False,   # can't confirm without visiting URL
+                    "has_social_media":     False,
+                    "runs_paid_ads":        False,
+                    "google_reviews_count": reviews_val,
+                    "rating":               round(rating_val, 1),
+                })
+
+        # ── Deduplicate and cap ──────────────────────────────────────────────
+        seen2, unique = set(), []
+        for p in prospects:
+            k = p["business_name"].lower()
+            if k not in seen2:
+                seen2.add(k)
+                unique.append(p)
+        prospects = unique[:15]
+
+        # ── Fallback / supplement ────────────────────────────────────────────
+        if len(prospects) < 5:
+            console.print(
+                f"[yellow][!] Live scraping returned {len(prospects)} result(s) — "
+                f"supplementing with sample data.[/yellow]"
+            )
+            sample = _sample_fallback(trade, location)
+            existing = {p["business_name"].lower() for p in prospects}
+            for sp in sample:
+                if sp["business_name"].lower() not in existing:
+                    prospects.append(sp)
+
+        return prospects
+
+    except Exception as exc:
+        console.print(
+            f"[yellow][!] Live scraping failed ({exc.__class__.__name__}: {exc}) — "
+            f"falling back to sample data.[/yellow]"
+        )
+        return _sample_fallback(trade, location)
+
+
+def _sample_fallback(trade, location):
+    """Return sample prospects filtered by trade/location (mirrors old discovery logic)."""
+    filtered = [
+        p for p in SAMPLE_PROSPECTS
+        if p["trade"].lower() == trade.lower()
+        and location.lower() in p["location"].lower()
+    ]
+    if not filtered:
+        filtered = [p for p in SAMPLE_PROSPECTS if p["trade"].lower() == trade.lower()]
+    if not filtered:
+        filtered = SAMPLE_PROSPECTS[:8]
+    return filtered
+
 
 # =============================================================================
 # DATABASE  (in-memory SQLite)
@@ -621,24 +866,33 @@ def step_prospect_discovery(trade, location):
     """Step 3 — Prospect Discovery."""
     print_step_header(3, 8, "Prospect Discovery Process")
 
-    spinner_task(f"Searching Google Maps for [bold]{trade}[/bold] contractors in {location}...", 1.2)
-    spinner_task("Scraping online directories (Yelp, Angi, HomeAdvisor)...", 0.9)
-    spinner_task("Cross-referencing BBB and local chamber listings...", 0.7)
+    # Parse city / state from "City, ST" format for the scraper
+    parts = [p.strip() for p in location.split(",", 1)]
+    city  = parts[0]
+    state = parts[1] if len(parts) > 1 else ""
 
-    # Filter by trade and location
-    filtered = [
-        p for p in SAMPLE_PROSPECTS
-        if p["trade"].lower() == trade.lower()
-        and location.lower() in p["location"].lower()
-    ]
-    if not filtered:
-        filtered = [p for p in SAMPLE_PROSPECTS if p["trade"].lower() == trade.lower()]
-    if not filtered:
-        filtered = SAMPLE_PROSPECTS[:8]
+    spinner_task(f"Searching Google for [bold]{trade}[/bold] contractors in {location}...", 0.8)
+
+    # ── Live scrape (falls back internally if it fails or returns < 5) ──────
+    filtered = scrape_prospects(trade, city, state)
+
+    # Label the source so the user knows what they're looking at
+    live_count   = sum(1 for p in filtered if p.get("owner_name") != "Business Owner")
+    scrape_count = len(filtered) - live_count
+    if SCRAPING_AVAILABLE and live_count == 0 and scrape_count > 0:
+        source_tag = "[yellow](sample data — scraper returned no results)[/yellow]"
+    elif SCRAPING_AVAILABLE and live_count > 0:
+        source_tag = f"[green](live: {live_count})[/green]"
+        if scrape_count:
+            source_tag += f" [yellow]+ {scrape_count} sample[/yellow]"
+    else:
+        source_tag = "[yellow](sample data)[/yellow]"
+
+    spinner_task("Cross-referencing BBB and local chamber listings...", 0.6)
 
     console.print(
         f"\n[bold green]✓ Found {len(filtered)} prospects[/bold green] "
-        f"matching your criteria\n"
+        f"matching your criteria  {source_tag}\n"
     )
 
     table = Table(
